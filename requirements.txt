@@ -1,0 +1,15 @@
+streamlit>=1.50
+pandas>=2.0
+openpyxl>=3.1
+xlrd>=2.0.1
+lxml>=5.0
+html5lib>=1.1
+Pillow>=10.0
+pytesseract>=0.3.10
+supabase>=2.5
+tzdata
+anthropic>=0.40
+opencv-python-headless>=4.8
+reportlab>=4.0
+arabic-reshaper>=3.0
+python-bidi>=0.4.2

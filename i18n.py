@@ -216,6 +216,13 @@ S.update({
     "aua_approval_created": ("إنشاء موافقة", "Approval created"), "aua_approval_decided": ("قرار موافقة", "Approval decision"),
     "aua_member_import": ("استيراد ماستر", "Master import"), "aua_policy_dates": ("تعديل تواريخ وثيقة", "Policy dates edited"),
     "aua_portal_code": ("إنشاء كود موظف", "Employee code generated"),
+    "err_required": ("الموبايل والرقم الوظيفي والفئة (Plan) مطلوبين", "Phone, staff number and tier (plan) are required"),
+    "files_missing": ("ناقص بيانات مطلوبة لـ Allianz في: {names}. كمّلها قبل ما تبعت الملف.",
+                      "Required Allianz fields are missing for: {names}. Complete them before sending the file."),
+    "files_mail": ("جهّز إيميل Allianz", "Prepare Allianz email"),
+    "files_mail_text": ("نص الإيميل (للنسخ)", "Email text (to copy)"),
+    "files_mail_note": ("الإيميل بيتفتح جاهز بالعنوان والموضوع والنص، والملف بتحمّله وتضيفه إنت (البرنامج مبيبعتش إيميلات).",
+                        "The email opens with address, subject and text filled in. Download the file and attach it yourself (the app does not send emails)."),
 })
 
 

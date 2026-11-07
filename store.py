@@ -521,7 +521,7 @@ def create_add_request(policy_no, data, effective_date, user):
 
 def _snapshot(m):
     return {k: nn(m.get(k)) for k in ("name", "staff_no", "card_no", "national_id", "dob", "gender",
-                                      "category", "dependency")}
+                                      "category", "dependency", "source_start", "source_end")}
 
 
 def create_delete_request(member, effective_date, user, details=None):
@@ -617,18 +617,45 @@ def change_status(rid, new, user):
 
 
 # ───────────────────────── ملفات الإضافة/الحذف ─────────────────────────
+ALLIANZ_EMAIL = "Health.Corporate@allianz.com.eg"
+# نفس أعمدة شيت Allianz بالظبط (بما فيها الإملاء Beneficary)
+ALLIANZ_COLS = ["Employee No", "Employee Name", "Date of Birth", "Gender", "Dependency", "Category", "Card Number",
+                "Start Date", "End Date", "Cost Center", "Beneficary Pin", "Emp Location", "Notes", "Department Name"]
+_MON = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+
+
+def fmt_allianz(v, short=False):
+    """01-SEP-1975 (أو 29-SEP-26 لو short) زي شيت Allianz."""
+    iso = to_iso(v)
+    if not iso:
+        return None
+    return f"{iso[8:10]}-{_MON[int(iso[5:7]) - 1]}-{iso[2:4] if short else iso[:4]}"
+
+
+def _allianz_row(**kw):
+    return {c: kw.get(c.replace(" ", "_")) for c in ALLIANZ_COLS}
+
+
 def export_df(rtype, reqs):
     rows = []
+    pol_end = {str(x["policy_no"]): x["end_date"] for x in policies_df().to_dict("records")} if rtype in ("add", "delete") else {}
     for r in reqs.to_dict("records"):
         p = _payload(r)
-        if rtype == "add":
-            rows.append({"Name": r["member_name"], "National ID": p.get("national_id"), "DOB": fmt_date(p.get("dob")),
-                         "Phone": p.get("phone"), "Staff ID": p.get("staff_no"), "Date": fmt_date(r["effective_date"]),
-                         "Policy": r["policy_no"]})
-        elif rtype == "delete":
-            rows.append({"Name": r["member_name"], "Staff ID": p.get("staff_no"), "Card No": p.get("card_no"),
-                         "National ID": p.get("national_id"), "DOB": fmt_date(p.get("dob")), "Policy": r["policy_no"],
-                         "Deletion Date": fmt_date(r["effective_date"])})
+        gender = {"M": "Male", "F": "Female"}.get(norm_gender(p.get("gender")))
+        dep = str(p["dependency"]).title() if nn(p.get("dependency")) else None
+        if rtype == "add":  # الإضافة: تاريخ الإضافة = Start Date، والنهاية من الكارنيه أو من نهاية الوثيقة
+            rows.append(_allianz_row(
+                Employee_No=p.get("staff_no"), Employee_Name=r["member_name"], Date_of_Birth=fmt_allianz(p.get("dob")),
+                Gender=gender, Dependency=dep, Category=norm_category(p.get("category")),
+                Start_Date=fmt_allianz(r["effective_date"], True),
+                End_Date=fmt_allianz(p.get("source_end") or pol_end.get(str(r["policy_no"])), True),
+                Notes=p.get("national_id")))
+        elif rtype == "delete":  # الحذف: End Date = تاريخ الحذف
+            rows.append(_allianz_row(
+                Employee_No=p.get("staff_no"), Employee_Name=r["member_name"], Date_of_Birth=fmt_allianz(p.get("dob")),
+                Gender=gender, Dependency=dep, Category=norm_category(p.get("category")), Card_Number=p.get("card_no"),
+                Start_Date=fmt_allianz(p.get("source_start"), True), End_Date=fmt_allianz(r["effective_date"], True),
+                Notes=p.get("national_id")))
         elif rtype == "upgrade":
             rows.append({"Name": r["member_name"], "Staff ID": p.get("staff_no"), "Card No": p.get("card_no"),
                          "National ID": p.get("national_id"), "Policy": r["policy_no"],
@@ -637,7 +664,7 @@ def export_df(rtype, reqs):
         else:
             rows.append({"Name": r["member_name"], "Staff ID": p.get("staff_no"), "Card No": p.get("card_no"),
                          "Policy": r["policy_no"], "Reason": p.get("reason"), "Date": fmt_date(r["effective_date"])})
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=ALLIANZ_COLS if rtype in ("add", "delete") else None)
 
 
 def to_excel_bytes(df):

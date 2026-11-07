@@ -2,6 +2,7 @@ import hmac
 import html
 import time
 import traceback
+from urllib.parse import quote
 from datetime import date, timedelta
 
 import pandas as pd
@@ -328,7 +329,7 @@ def add_member_tab():
         phone = r5[1].text_input(t("f_phone"), key=f"a_phone_{fv}")
         eff = r5[2].date_input(t("f_eff"), value=date.today(), key=f"a_eff_{fv}")
         if st.form_submit_button(t("submit_add")):
-            if not (staff.strip() and phone.strip()):
+            if not (staff.strip() and phone.strip() and categ):
                 st.error(t("err_required"))
             else:
                 rec, e = S.create_add_request(pol, {"name": name, "staff_no": staff, "national_id": nid,
@@ -361,7 +362,7 @@ def page_members():
     if stt != "*":
         view = view[view["status"] == stt]
     if q:
-        hay = view[["name", "staff_no", "card_no"]].astype(str).agg(" ".join, axis=1)
+        hay = view[["name", "staff_no", "card_no"]].fillna("").astype(str).agg(" ".join, axis=1)
         view = view[hay.str.contains(q, case=False, na=False, regex=False)]
     c = st.columns(6)
     stat(c[0], len(view), t("n_total"))
@@ -481,7 +482,7 @@ def page_requests():
     if pol != "*":
         v = v[v["policy_no"].astype(str) == pol]
     if q:
-        hay = v[["ref_no", "member_name", "staff_no"]].astype(str).agg(" ".join, axis=1)
+        hay = v[["ref_no", "member_name", "staff_no"]].fillna("").astype(str).agg(" ".join, axis=1)
         v = v[hay.str.contains(q, case=False, na=False, regex=False)]
     if v.empty:
         st.info(t("nothing"))
@@ -582,6 +583,12 @@ def page_import():
         ids = st.multiselect(t("files_pick"), list(lab), default=list(lab), format_func=lab.get)
         sel = df[df["id"].isin(ids)]
         exp = S.export_df(rtype, sel)
+        need = {"add": ["Employee No", "Category", "Start Date", "Date of Birth", "Gender"],
+                "delete": ["Employee No", "Card Number", "End Date"]}.get(rtype)
+        if need and not exp.empty:
+            bad = exp[exp[need].isna().any(axis=1)]
+            if not bad.empty:
+                st.warning(t("files_missing").format(names=", ".join(bad["Employee Name"].astype(str))))
         table(exp)
         c1, c2 = st.columns(2)
         c1.download_button(t("files_dl"), S.to_excel_bytes(exp), f"{rtype.upper()}_{pol}_{date.today()}.xlsx",
@@ -591,6 +598,19 @@ def page_import():
                 S.change_status(i, "sent", user())
             flash("success", t("files_marked").format(n=len(ids)))
             st.rerun()
+        if not sel.empty:
+            kind = {"add": "Addition", "delete": "Deletion", "replace": "Card replacement",
+                    "upgrade": "Tier upgrade"}[rtype]
+            school = S.CLIENTS_MAP.get(pol, "")
+            subject = f"{kind} request - Policy {pol} - {school}"
+            body = (f"Dear Allianz Health Corporate team,\n\nPlease find attached the {kind.lower()} file for policy "
+                    f"{pol} ({school}) - {len(sel)} member(s).\nKindly process it and confirm once done.\n\n"
+                    f"Best regards,\n{user()}")
+            st.link_button(t("files_mail"),
+                           f"mailto:{S.ALLIANZ_EMAIL}?subject={quote(subject)}&body={quote(body)}")
+            st.caption(t("files_mail_note"))
+            with st.expander(t("files_mail_text")):
+                st.code(f"To: {S.ALLIANZ_EMAIL}\nSubject: {subject}\n\n{body}", language=None)
 
 
 def page_settings():
@@ -741,7 +761,7 @@ def page_reports():
     with t_search:
         q = st.text_input(t("rp_search_ph"), key="rp_q")
         if q.strip():
-            hay = members[["name", "staff_no", "card_no", "national_id"]].astype(str).agg(" ".join, axis=1)
+            hay = members[["name", "staff_no", "card_no", "national_id"]].fillna("").astype(str).agg(" ".join, axis=1)
             hit = members[hay.str.contains(q.strip(), case=False, na=False, regex=False)].head(100)
             st.caption(t("rp_found").format(n=len(hit)))
             if not hit.empty:
@@ -827,7 +847,7 @@ def audit_tab():
     lim = f[2].selectbox("#", [200, 500, 1000], key="au_lim")
     v = log if act == "*" else log[log["action"] == act]
     if q:
-        hay = v[["actor", "ref", "details"]].astype(str).agg(" ".join, axis=1)
+        hay = v[["actor", "ref", "details"]].fillna("").astype(str).agg(" ".join, axis=1)
         v = v[hay.str.contains(q, case=False, na=False, regex=False)]
     v = v.head(lim)
     if v.empty:

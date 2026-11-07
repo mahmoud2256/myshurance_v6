@@ -4,6 +4,7 @@ import hmac
 import io
 import re
 import secrets
+import time
 import uuid
 from collections import defaultdict
 from datetime import date, datetime, timedelta
@@ -51,6 +52,8 @@ COLS = {
     "approvals": ["ref_no", "member_id", "member_name", "staff_no", "policy_no", "approval_type", "provider",
                   "hospital", "amount", "details", "status", "created_by", "decided_by", "updated_at"],
     "audit_log": ["actor", "role", "action", "entity", "ref", "details"],
+    "insurance_providers": ["name", "code", "is_active", "email"],
+    "client_companies": ["name", "provider_id", "policy_no", "is_active"],
 }
 
 TYPE_AR = {"add": "إضافة", "delete": "حذف", "replace": "بدل فاقد", "upgrade": "ترقية فئة"}
@@ -355,10 +358,13 @@ def policies_df():
     df = load("policies")
     rows = {str(r["policy_no"]): r for r in df.to_dict("records")}
     out = []
-    for no, school in CLIENTS_MAP.items():
+    all_schools = _schools()["schools"]
+    for no, school in clients().items():
         r = rows.pop(no, {})
         out.append({"policy_no": no, "school": school, "start_date": to_iso(r.get("start_date")),
                     "end_date": to_iso(r.get("end_date"))})
+    for no in [n for n in rows if n in all_schools]:  # مدرسة معطّلة: مش بتظهر
+        rows.pop(no)
     for no, r in rows.items():
         out.append({"policy_no": no, "school": "", "start_date": to_iso(r.get("start_date")),
                     "end_date": to_iso(r.get("end_date"))})
@@ -386,7 +392,7 @@ def _t():
 
 def _ctx(req):
     pol = nn(req.get("policy_no")) or "—"
-    school = CLIENTS_MAP.get(pol, "")
+    school = school_name(pol)
     return pol, f" ({school})" if school else ""
 
 
@@ -784,7 +790,8 @@ def employee_submit_approval(member, ap_type, hospital, amount, details):
     if len(pend) >= MAX_EMP_PENDING:
         return None, "err_too_many"
     amount = min(max(float(amount or 0), 0.0), 10_000_000.0)
-    return create_approval(member, ap_type, "Allianz", (nn(hospital) or "")[:120] or None, amount,
+    return create_approval(member, ap_type, provider_for(member["policy_no"])["name"] or "Allianz",
+                           (nn(hospital) or "")[:120] or None, amount,
                            (nn(details) or "")[:300] or None, f"{member['name']} · employee")
 
 
@@ -848,3 +855,152 @@ def alerts(members, reqs, appr, pols, stale_days=2, soon_days=30):
     act["_end"] = act["source_end"].map(to_iso).fillna("")
     out["members_soon"] = act[(act["_end"] >= today) & (act["_end"] <= limit) & (act["_end"] != "")]
     return out
+
+
+
+# ───────────────────────── المدارس وشركات التأمين (في قاعدة البيانات) ─────────────────────────
+_EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+
+
+def _flag(v, default=True):
+    v = nn(v)
+    return default if v is None else bool(v)
+
+
+def invalidate_schools():
+    st.session_state.pop("_schools", None)
+
+
+def _provider_id(name, prov_df):
+    """id شركة التأمين بالاسم (بدون حساسية لحالة الحروف)، وبتتعمل لو مش موجودة."""
+    key = str(name).casefold()
+    for r in prov_df.to_dict("records"):
+        if str(nn(r["name"]) or "").casefold() == key:
+            return r["id"]
+    return insert("insurance_providers", {"name": name}).get("id")
+
+
+def _schools():
+    """{'schools': {رقم الوثيقة: بيانات}, 'providers': {id: بيانات}}، مخزّنة 30 ثانية في الجلسة.
+    أول مرة بتنقل المدارس الأربعة القديمة (CLIENTS_MAP) لقاعدة البيانات تحت Allianz."""
+    ss = st.session_state
+    c = ss.get("_schools")
+    if c and time.time() - c["t"] < 30:
+        return c["data"]
+    prov, comp = load("insurance_providers"), load("client_companies")
+    have = {str_id(x) for x in comp["policy_no"].dropna()} if not comp.empty else set()
+    missing = {no: n for no, n in CLIENTS_MAP.items() if no not in have}
+    if missing:
+        try:
+            pid = _provider_id("Allianz", prov)
+            for no, name in missing.items():
+                insert("client_companies", {"name": name, "provider_id": pid, "policy_no": no})
+            prov, comp = load("insurance_providers"), load("client_companies")
+        except Exception:  # noqa: BLE001 - لو الجداول مش جاهزة نكمل بالقايمة القديمة
+            pass
+    provs = {r["id"]: {"id": r["id"], "name": nn(r["name"]), "email": nn(r.get("email")),
+                       "active": _flag(r.get("is_active"))} for r in prov.to_dict("records")}
+    schools = {}
+    for r in comp.to_dict("records"):
+        no = str_id(r["policy_no"])
+        if not no:
+            continue
+        p = provs.get(nn(r["provider_id"]), {})
+        schools[no] = {"id": r["id"], "name": nn(r["name"]) or "", "provider_id": nn(r["provider_id"]),
+                       "provider": p.get("name"), "active": _flag(r.get("is_active"))}
+    if not schools:  # fallback: مفيش اتصال بالجداول
+        schools = {no: {"id": None, "name": n, "provider_id": None, "provider": "Allianz", "active": True}
+                   for no, n in CLIENTS_MAP.items()}
+    data = {"schools": schools, "providers": provs}
+    ss["_schools"] = {"t": time.time(), "data": data}
+    return data
+
+
+def clients():
+    """المدارس المفعّلة فقط: {رقم الوثيقة: الاسم}."""
+    return {no: s["name"] for no, s in _schools()["schools"].items() if s["active"]}
+
+
+def school_name(policy_no):
+    s = _schools()["schools"].get(str(nn(policy_no) or ""))
+    return s["name"] if s else ""
+
+
+def school_list():
+    """كل المدارس (حتى المعطّلة) للشاشة الإدارية."""
+    return _schools()["schools"]
+
+
+def provider_list():
+    return sorted((p for p in _schools()["providers"].values() if p["active"] and p["name"]),
+                  key=lambda p: p["name"].casefold()) or [{"id": None, "name": n, "email": None, "active": True} for n in PROVIDERS]
+
+
+def provider_names():
+    return [p["name"] for p in provider_list()]
+
+
+def provider_for(policy_no):
+    """{'name', 'email'} لشركة التأمين بتاعة الوثيقة. Allianz من غير إيميل بتاخد الإيميل القديم."""
+    sd = _schools()
+    s = sd["schools"].get(str(nn(policy_no) or ""))
+    name = s["provider"] if s else None
+    email = (sd["providers"].get(s["provider_id"]) or {}).get("email") if s else None
+    if not email and (name or "").casefold() == "allianz":
+        email = ALLIANZ_EMAIL
+    return {"name": name or "", "email": email or ""}
+
+
+def _ensure_provider(name, email):
+    name, email = nn(name), nn(email)
+    if not name:
+        return None, "err_provider_required"
+    if email and not _EMAIL_RE.fullmatch(email):
+        return None, "err_email_bad"
+    prov = load("insurance_providers")
+    for r in prov.to_dict("records"):
+        if str(nn(r["name"]) or "").casefold() == name.casefold():
+            if email and not nn(r.get("email")):
+                update("insurance_providers", r["id"], {"email": email})
+            return r["id"], None
+    return insert("insurance_providers", {"name": name, "email": email}).get("id"), None
+
+
+def add_school(name, policy_no, provider_name, provider_email=None):
+    name, no = nn(name), re.sub(r"\s+", "", str(nn(policy_no) or ""))
+    if not name or not no.isdigit() or len(no) < 6:
+        return None, "err_school_fields"
+    invalidate_schools()
+    if no in school_list():
+        return None, "err_school_dup"
+    pid, err = _ensure_provider(provider_name, provider_email)
+    if err:
+        return None, err
+    rec = insert("client_companies", {"name": name, "provider_id": pid, "policy_no": no})
+    invalidate_schools()
+    audit("school_added", "school", no, f"{name} | {nn(provider_name)}")
+    return rec, None
+
+
+def update_school(policy_no, name, provider_name, active):
+    s = school_list().get(str(policy_no))
+    name = nn(name)
+    if not s or not s["id"] or not name:
+        return "err_school_fields"
+    pid, err = _ensure_provider(provider_name, None)
+    if err:
+        return err
+    update("client_companies", s["id"], {"name": name, "provider_id": pid, "is_active": bool(active)})
+    invalidate_schools()
+    audit("school_updated", "school", str(policy_no), f"{name} | {nn(provider_name)} | active={bool(active)}")
+    return None
+
+
+def set_provider_email(provider_id, email):
+    email = nn(email)
+    if email and not _EMAIL_RE.fullmatch(email):
+        return "err_email_bad"
+    update("insurance_providers", provider_id, {"email": email})
+    invalidate_schools()
+    audit("provider_email", "provider", str(provider_id)[:8], email or "(cleared)")
+    return None

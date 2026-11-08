@@ -140,6 +140,60 @@ def date_or_none(iso):
 
 
 # ───────────────────────── الدخول ─────────────────────────
+AUTH_COOKIE = "ms_auth"
+
+
+def remember(token):
+    """يجهّز كوكي "تذكّرني" (بيتكتب في المتصفح في الـ run الجاي). من غير COOKIE_SECRET مبيحصلش حاجة."""
+    st.session_state.pop("_no_auto", None)
+    if token:
+        st.session_state["_cookie_out"] = ("set", token)
+
+
+def emit_cookie():
+    act = st.session_state.pop("_cookie_out", None)
+    if not act:
+        return
+    kind, tok = act
+    val, age = (tok, S.SESSION_TTL) if kind == "set" else ("", 0)  # التوكن حروف آمنة فقط (base64url + hex)
+    js = (f'<script>(function(){{var s="{AUTH_COOKIE}={val}; path=/; max-age={age}; SameSite=Lax";'
+          f'if(location.protocol==="https:")s+="; Secure";document.cookie=s;}})();</script>')
+    try:
+        st.html(js, unsafe_allow_javascript=True)
+    except TypeError:  # نسخة Streamlit أقدم
+        import streamlit.components.v1 as components
+        components.html(js, height=0)
+
+
+def request_cookies():
+    try:
+        return dict(st.context.cookies)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def try_auto_login():
+    """لو فيه كوكي دخول سليم (توقيع + لسه ما انتهاش + الباسورد/الكود ما اتغيرش) ندخّله من غير باسورد."""
+    ss = st.session_state
+    if "role" in ss or ss.get("_no_auto") or not S.secret_cookie():
+        return
+    d = S.read_session_token(request_cookies().get(AUTH_COOKIE))
+    if not d:
+        return
+    if d["r"] in ("admin", "viewer"):
+        pw = S.secret("ADMIN_PASSWORD" if d["r"] == "admin" else "VIEWER_PASSWORD")
+        if pw and S.token_fp(pw) == d.get("f"):
+            ss.role, ss.user_name = d["r"], d.get("n") or ""
+        return
+    m = S.load("members")
+    hit = m[m["id"] == d.get("m")]
+    if hit.empty:
+        return
+    r = hit.iloc[0]
+    if (S.nn(r["status"]) or "active") == "active" and S.nn(r.get("portal_pw")) and S.token_fp(r["portal_pw"]) == d.get("f"):
+        ss.role, ss.user_name, ss.member_id = "employee", r["name"], r["id"]
+
+
 def login_screen():
     c = st.columns([1, 1.2, 1])[1]
     with c:
@@ -160,6 +214,7 @@ def login_screen():
                         if hmac.compare_digest(typed.encode(), pw[role].encode()):
                             S.audit("login", "session", None, role, actor=name.strip() or "—", role=role)
                             st.session_state.role, st.session_state.user_name = role, name.strip()
+                            remember(S.make_session_token(role, name.strip(), None, S.token_fp(pw[role])))
                             st.rerun()
                         else:
                             S.audit("login_failed", "session", None, role, actor=name.strip() or "—", role=role)
@@ -177,6 +232,7 @@ def login_screen():
                         if m:
                             S.audit("login", "session", None, "employee", actor=m["name"], role="employee")
                             ss.role, ss.user_name, ss.member_id, ss.emp_fail = "employee", m["name"], m["id"], 0
+                            remember(S.make_session_token("employee", m["name"], m["id"], S.token_fp(m["portal_pw"])))
                             st.rerun()
                         else:
                             S.audit("login_failed", "session", None, f"employee nid ***{str(nid).strip()[-4:]}",
@@ -689,8 +745,15 @@ def page_settings():
     st.header(t("settings"))
     st.write("**Providers:** " + ", ".join(S.provider_names()))
     table(pd.DataFrame({t("c_policy"): list(S.clients()), t("c_company"): list(S.clients().values())}))
+    if S.secret_cookie():
+        st.success(t("remember_on"))
+    else:
+        st.warning(t("remember_off"))
     st.subheader(t("set_scan"))
-    st.success(t("scan_ai_on")) if ocr.claude_available() else st.warning(t("scan_no_ai"))
+    if ocr.claude_available():
+        st.success(t("scan_ai_on"))
+    else:
+        st.warning(t("scan_no_ai"))
     st.subheader(t("set_notif"))
     if S.SB:
         st.success(t("sb_ok"))
@@ -1002,6 +1065,8 @@ def logout_button():
     if st.button(t("logout")):
         for k in ("role", "user_name", "member_id", "_new_code"):
             st.session_state.pop(k, None)
+        st.session_state["_cookie_out"] = ("clear", None)
+        st.session_state["_no_auto"] = True  # عشان الكوكي القديم ما يدخّلوش تاني قبل ما يتمسح
         st.rerun()
 
 
@@ -1020,6 +1085,8 @@ def main():
     with st.sidebar:
         st.radio("lang", ["العربية", "English"], horizontal=True, key="lang_label", label_visibility="collapsed")
     inject_css()
+    try_auto_login()
+    emit_cookie()
     if "role" not in st.session_state:
         login_screen()
         return

@@ -81,7 +81,8 @@ S = {
     "scan_ai_on": ("القراءة بالذكاء الاصطناعي مفعّلة", "AI reading is enabled"),
     # أخطاء
     "err_name": ("الاسم مطلوب", "Name is required"), "err_policy": ("اختر الوثيقة", "Select a policy"),
-    "err_nid": ("الرقم القومي لازم 14 رقم صحيح", "National ID must be a valid 14 digits"),
+    "err_nid": ("الرقم القومي غير صحيح: لازم 14 رقم يبدأ بـ 2 أو 3 وتاريخ الميلاد جواه صحيح (الأرقام من 2 لـ 7)",
+                "Invalid national ID: it must be 14 digits, start with 2 or 3, and contain a valid birth date (digits 2-7)"),
     "err_exists": ("العضو موجود بالفعل ونشط في الوثيقة دي", "Member already exists and is active in this policy"),
     "err_dup_req": ("فيه طلب إضافة مفتوح لنفس العضو", "An open add request already exists for this member"),
     "err_not_active": ("العضو مش نشط", "Member is not active"),

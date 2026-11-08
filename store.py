@@ -1,7 +1,9 @@
 """طبقة البيانات + منطق العمل لبرنامج Myshurance."""
+import base64
 import hashlib
 import hmac
 import io
+import json
 import re
 import secrets
 import time
@@ -1004,3 +1006,44 @@ def set_provider_email(provider_id, email):
     invalidate_schools()
     audit("provider_email", "provider", str(provider_id)[:8], email or "(cleared)")
     return None
+
+
+
+# ───────────────────────── تذكّر الدخول (كوكي موقّع، 8 ساعات) ─────────────────────────
+SESSION_TTL = 8 * 3600  # يوم شغل
+
+
+def token_fp(value):
+    """بصمة قصيرة لباسورد/كود: لو اتغيّر، أي دخول متذكّر قبله بيبطل."""
+    return hashlib.sha256(str(value).encode()).hexdigest()[:10]
+
+
+def make_session_token(role, name, member_id=None, fp=""):
+    secret = secret_cookie()
+    if not secret:
+        return None
+    body = json.dumps({"r": role, "n": name, "m": member_id, "f": fp, "e": int(time.time()) + SESSION_TTL},
+                      separators=(",", ":"), ensure_ascii=False)
+    b = base64.urlsafe_b64encode(body.encode()).decode().rstrip("=")
+    return f"{b}.{hmac.new(secret.encode(), b.encode(), hashlib.sha256).hexdigest()}"
+
+
+def read_session_token(tok):
+    """يرجّع بيانات الدخول لو التوقيع سليم ولسه مانتهتش، وإلا None."""
+    secret = secret_cookie()
+    if not secret or not tok or tok.count(".") != 1:
+        return None
+    b, sig = tok.split(".")
+    if not hmac.compare_digest(hmac.new(secret.encode(), b.encode(), hashlib.sha256).hexdigest(), sig):
+        return None
+    try:
+        d = json.loads(base64.urlsafe_b64decode(b + "=" * (-len(b) % 4)).decode())
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(d, dict) or d.get("e", 0) < time.time() or d.get("r") not in ("admin", "viewer", "employee"):
+        return None
+    return d
+
+
+def secret_cookie():
+    return secret("COOKIE_SECRET")

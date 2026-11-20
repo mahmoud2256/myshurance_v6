@@ -707,16 +707,22 @@ def page_import():
         ids = st.multiselect(t("files_pick"), list(lab), default=list(lab), format_func=lab.get)
         sel = df[df["id"].isin(ids)]
         exp = S.export_df(rtype, sel)
-        need = {"add": ["Employee No", "Category", "Start Date", "Date of Birth", "Gender"],
-                "delete": ["Employee No", "Card Number", "End Date"]}.get(rtype)
+        need = {"add": ["Staff ID", "* Plan", "* Date of Birth ", "* Gender ", "* National ID"],
+                "delete": ["Staff ID", "* National ID"],
+                "upgrade": ["Staff ID", "* Plan", "* National ID"]}.get(rtype)
         if need and not exp.empty:
             bad = exp[exp[need].isna().any(axis=1)]
             if not bad.empty:
-                st.warning(t("files_missing").format(names=", ".join(bad["Employee Name"].astype(str))))
+                names = (bad["* First Name"].fillna("") + " " + bad["* Family Name"].fillna("")).str.strip()
+                st.warning(t("files_missing").format(names=", ".join(names)))
         table(exp)
         c1, c2 = st.columns(2)
-        c1.download_button(t("files_dl"), S.to_excel_bytes(exp), f"{rtype.upper()}_{pol}_{date.today()}.xlsx",
-                           mime=XLSX, disabled=sel.empty)
+        if rtype in S.CENSUS_COLS:
+            payload = S.census_workbook({rtype: exp})
+        else:
+            payload = S.to_excel_bytes(exp)
+        fname = S.census_filename(rtype, sel.to_dict("records") or [{}], S.school_name(pol), pol)
+        c1.download_button(t("files_dl"), payload, fname, mime=XLSX, disabled=sel.empty)
         if can_edit() and c2.button(t("files_mark_sent"), disabled=sel.empty):
             for i in ids:
                 S.change_status(i, "sent", user())
@@ -749,6 +755,20 @@ def page_settings():
         st.success(t("remember_on"))
     else:
         st.warning(t("remember_off"))
+    ecfg = S.email_cfg()
+    if ecfg:
+        st.success(t("email_on").format(to=", ".join(ecfg["to"])))
+        if can_edit() and st.button(t("email_test")):
+            err = S.send_email_now(ecfg, "[Myshurance] " + t("email_test_subject"), t("email_test_body"), "test")
+            if err:
+                st.error(t("email_test_fail").format(e=err))
+            else:
+                st.success(t("email_test_ok"))
+        st_ = S.email_state()
+        if st_["last_error"]:
+            st.error(t("email_err").format(e=st_["last_error"]))
+    else:
+        st.warning(t("email_off"))
     st.subheader(t("set_scan"))
     if ocr.claude_available():
         st.success(t("scan_ai_on"))

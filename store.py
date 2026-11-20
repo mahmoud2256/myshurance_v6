@@ -2,14 +2,21 @@
 import base64
 import hashlib
 import hmac
+import html as html_lib
 import io
 import json
+import queue
 import re
 import secrets
+import smtplib
+import ssl
+import threading
 import time
 import uuid
 from collections import defaultdict
 from datetime import date, datetime, timedelta
+from email.message import EmailMessage
+from email.utils import formataddr
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -443,11 +450,170 @@ def notify_policy(policy_no, start, end, user):
     audit("policy_dates", "policy", policy_no, f"{to_iso(start)} -> {to_iso(end)}")
 
 
-def notify(event, message):
+def notify(event, message, attach=None):
     try:
         insert("notifications", {"event": event, "message": message, "status": "pending", "attempts": 0})
     except Exception as e:  # noqa: BLE001 - الإشعار ميوقفش الشغل
         st.warning(f"notifications: {e}")
+    send_email_async(event, message, attach)  # نسخة على الإيميل في نفس اللحظة (لو متظبط)
+
+
+# ───────────────────────── إشعارات الإيميل (نسخة من إشعار الواتس اب) ─────────────────────────
+_MAIL_RE = re.compile(r"[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+")
+_EMAIL_STATE = {"last_error": None, "last_ok": None}
+_MAIL_Q = queue.Queue()
+_mail_lock = threading.Lock()
+_mail_worker = None
+BURST_SECONDS = 1.0  # إشعارات كتير في ثانية واحدة (زي تعليم 30 طلب) بتتجمّع في إيميل واحد
+
+
+def email_cfg():
+    """إعدادات الإرسال من Secrets، أو None لو الإيميل مش متظبط. NOTIFY_EMAIL لو فاضي بيتبعت لإيميل المرسل نفسه."""
+    user, pw = secret("SMTP_USER"), secret("SMTP_PASSWORD")
+    if not user or not pw:
+        return None
+    to = _MAIL_RE.findall(secret("NOTIFY_EMAIL") or user)
+    if not to:
+        return None
+    sec = (secret("SMTP_SECURITY") or "").lower()
+    port = int(secret("SMTP_PORT") or (465 if sec == "ssl" else 587))
+    return {"host": secret("SMTP_HOST") or "smtp.gmail.com", "port": port,
+            "security": sec or ("ssl" if port == 465 else "starttls"), "user": user,
+            "password": pw.replace(" ", ""), "from": secret("SMTP_FROM") or user, "to": to}
+
+
+def email_state():
+    return dict(_EMAIL_STATE)
+
+
+def _request_attachment(rec):
+    """بيحفظ الطلب عشان يتحوّل لملف مرفق (Census List للإضافة/الحذف/الترقية) أو None لو الإرفاق مقفول."""
+    if (secret("EMAIL_ATTACH") or "").lower() in ("false", "0", "no", "off"):
+        return None
+    pol = str(rec.get("policy_no") or "")
+    return {"rtype": rec["type"], "policy": pol, "rec": dict(rec), "school": school_name(pol)}
+
+
+_TYPE_WORD = {"add": "Addition", "delete": "Deletion", "upgrade": "Upgrade", "replace": "Replacement",
+              "mixed": "Requests"}
+
+
+def _safe_part(v, limit=50):
+    """جزء من اسم ملف: بيشيل الرموز اللي ويندوز ما بيقبلهاش ويبدّل المسافات بشرطة."""
+    v = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "", str(v or "")).strip()
+    return re.sub(r"\s+", "-", v)[:limit].strip("-._")
+
+
+def census_filename(rtype, recs, school, policy=None, day=None):
+    """طلب واحد: اسم العضو_رقمه_المدرسة_النوع.xlsx . أكتر من طلب: المدرسة_النوع_عدد_التاريخ.xlsx"""
+    day = day or datetime.now(CAIRO).strftime("%Y-%m-%d")
+    word = _TYPE_WORD.get(rtype, rtype)
+    if len(recs) == 1:
+        r = recs[0]
+        parts = [r.get("member_name"), str_id(_payload(r).get("staff_no")) or str_id(r.get("staff_no")), school or policy,
+                 word]
+    else:
+        parts = [school or policy, word, f"{len(recs)}-members" if rtype != "mixed" else f"{len(recs)}-requests", day]
+    return "_".join(x for x in (_safe_part(p) for p in parts) if x)[:150] + ".xlsx"
+
+
+def _attachments_from(items):
+    """ملف لكل وثيقة. طلب واحد: باسم العضو ورقمه والمدرسة. أكتر من طلب: باسم المدرسة والعدد.
+    الإضافة والحذف والترقية في ملف Census (3 صفحات)، وبدل الفاقد في ملف بسيط لوحده."""
+    census, repl = {}, {}
+    for a in items:
+        if a:
+            (census if a["rtype"] in CENSUS_COLS else repl).setdefault(a["policy"], []).append(a)
+    files = []
+    for pol, lst in census.items():
+        types = {x["rtype"] for x in lst}
+        frames = {rt: census_df(rt, pd.DataFrame([x["rec"] for x in lst if x["rtype"] == rt])) for rt in types}
+        name = census_filename(next(iter(types)) if len(types) == 1 else "mixed", [x["rec"] for x in lst],
+                               lst[0].get("school"), pol)
+        files.append((name, census_workbook(frames)))
+    for pol, lst in repl.items():
+        name = census_filename("replace", [x["rec"] for x in lst], lst[0].get("school"), pol)
+        files.append((name, to_excel_bytes(export_df("replace", pd.DataFrame([x["rec"] for x in lst])))))
+    return files
+
+
+def _build_email(cfg, subject, text, event=None, attachments=()):
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = formataddr(("Myshurance", cfg["from"]))
+    msg["To"] = ", ".join(cfg["to"])
+    if event:
+        msg["X-Myshurance-Event"] = event
+    msg.set_content(text)
+    body = html_lib.escape(text)
+    msg.add_alternative(
+        '<div dir="rtl" style="font-family:Tahoma,Arial,sans-serif;font-size:15px;line-height:1.7;'
+        f'white-space:pre-line;text-align:right">{body}</div>', subtype="html")
+    for name, data in attachments:
+        msg.add_attachment(data, maintype="application",
+                           subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename=name)
+    return msg
+
+
+def send_email_now(cfg, subject, text, event=None, attachments=()):
+    """بيبعت فوراً ويرجّع None لو نجح أو نص الخطأ. (من غير ما يطبع أو يخزّن الباسورد)."""
+    try:
+        msg = _build_email(cfg, subject, text, event, attachments)
+        ctx = ssl.create_default_context()  # بيتأكد من شهادة السيرفر
+        if cfg["security"] == "ssl":
+            server = smtplib.SMTP_SSL(cfg["host"], cfg["port"], timeout=15, context=ctx)
+        else:
+            server = smtplib.SMTP(cfg["host"], cfg["port"], timeout=15)
+        with server:
+            if cfg["security"] == "starttls":
+                server.starttls(context=ctx)
+            if cfg["security"] != "none":
+                server.login(cfg["user"], cfg["password"])
+            server.send_message(msg)
+        _EMAIL_STATE.update(last_ok=datetime.now(CAIRO).strftime("%Y-%m-%d %H:%M"), last_error=None)
+        return None
+    except Exception as e:  # noqa: BLE001
+        err = f"{type(e).__name__}: {e}".replace(cfg.get("password") or "\0", "***")[:300]
+        _EMAIL_STATE["last_error"] = err
+        return err
+
+
+def _mail_loop():
+    while True:
+        batch = [_MAIL_Q.get()]
+        end = time.time() + BURST_SECONDS
+        while time.time() < end:
+            try:
+                batch.append(_MAIL_Q.get(timeout=max(0.05, end - time.time())))
+            except queue.Empty:
+                break
+        cfg = batch[0][0]
+        if len(batch) == 1:
+            _, subject, text, event, _a = batch[0]
+        else:
+            subject = f"[Myshurance] {len(batch)} إشعارات"
+            text = ("\n\n" + "─" * 18 + "\n\n").join(b[2] for b in batch)
+            event = "digest"
+        try:
+            files = _attachments_from([b[4] for b in batch])
+        except Exception:  # noqa: BLE001 - لو الإرفاق فشل نبعت الإيميل من غيره
+            files = []
+        if send_email_now(cfg, subject, text, event, files) is not None:
+            time.sleep(3)
+            send_email_now(cfg, subject, text, event, files)  # محاولة تانية لو الأولى فشلت
+
+
+def send_email_async(event, message, attach=None):
+    cfg = email_cfg()
+    if not cfg:
+        return
+    global _mail_worker
+    first = next((ln.strip() for ln in str(message).splitlines() if ln.strip()), event)
+    _MAIL_Q.put((cfg, f"[Myshurance] {first}"[:110], str(message), event, attach))
+    with _mail_lock:
+        if _mail_worker is None or not _mail_worker.is_alive():
+            _mail_worker = threading.Thread(target=_mail_loop, daemon=True)
+            _mail_worker.start()
 
 
 def audit(action, entity, ref=None, details=None, actor=None, role=None):
@@ -483,7 +649,7 @@ def create_request(rtype, policy_no, member_name, payload, user, member_id=None,
         "details": details, "payload": _json_safe(payload), "status": "draft", "created_by": user or None})
     rec = {**rec, "type": rtype, "member_name": member_name, "staff_no": staff_no, "policy_no": policy_no,
            "effective_date": to_iso(effective_date)}
-    notify("request_created", msg_created(rec, user))
+    notify("request_created", msg_created(rec, user), attach=_request_attachment(rec))
     audit("request_created", "request", rec.get("ref_no"), f"{rtype} | {member_name} | {policy_no}")
     return rec
 
@@ -529,7 +695,7 @@ def create_add_request(policy_no, data, effective_date, user):
 
 def _snapshot(m):
     return {k: nn(m.get(k)) for k in ("name", "staff_no", "card_no", "national_id", "dob", "gender",
-                                      "category", "dependency", "source_start", "source_end")}
+                                      "category", "dependency", "source_start", "source_end", "phone")}
 
 
 def create_delete_request(member, effective_date, user, details=None):
@@ -626,53 +792,90 @@ def change_status(rid, new, user):
 
 # ───────────────────────── ملفات الإضافة/الحذف ─────────────────────────
 ALLIANZ_EMAIL = "Health.Corporate@allianz.com.eg"
-# نفس أعمدة شيت Allianz بالظبط (بما فيها الإملاء Beneficary)
-ALLIANZ_COLS = ["Employee No", "Employee Name", "Date of Birth", "Gender", "Dependency", "Category", "Card Number",
-                "Start Date", "End Date", "Cost Center", "Beneficary Pin", "Emp Location", "Notes", "Department Name"]
 _MON = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
 
+# ───── ملف Census List (نفس صفحات وأعمدة شيت Allianz + رقم الوثيقة + تاريخ الإضافة/الحذف/الترقية) ─────
+CENSUS_SHEETS = {"add": "addition ", "delete": "deletion ", "upgrade": "up grade "}  # بنفس أسماء الشيت (فيها مسافة)
+_CENSUS_BASE = ["Staff ID", "* First Name", "* Family Name", "* Dependency", "* Gender ", "* Date of Birth ",
+                "* Plan", "* Mobile Number"]
+CENSUS_COLS = {
+    "add": _CENSUS_BASE + ["Email ID", "* National ID", "Policy No", "Addition Date"],
+    "delete": _CENSUS_BASE + ["Email ID", "* National ID", "Policy No", "Deletion Date"],
+    "upgrade": _CENSUS_BASE + ["* National ID", "Policy No", "Upgrade Date"],
+}
+_CENSUS_DATE_COLS = {"* Date of Birth ", "Addition Date", "Deletion Date", "Upgrade Date"}
+_CENSUS_TEXT_COLS = {"Staff ID", "* Mobile Number", "* National ID", "Policy No"}
 
-def fmt_allianz(v, short=False):
-    """01-SEP-1975 (أو 29-SEP-26 لو short) زي شيت Allianz."""
+
+def _to_date(v):
     iso = to_iso(v)
-    if not iso:
-        return None
-    return f"{iso[8:10]}-{_MON[int(iso[5:7]) - 1]}-{iso[2:4] if short else iso[:4]}"
+    return datetime.strptime(iso[:10], "%Y-%m-%d").date() if iso else None
 
 
-def _allianz_row(**kw):
-    return {c: kw.get(c.replace(" ", "_")) for c in ALLIANZ_COLS}
+def _census_row(rtype, r):
+    p = _payload(r)
+    first, _, family = str(nn(r.get("member_name")) or "").strip().partition(" ")
+    plan = norm_category(p.get("new_category") if rtype == "upgrade" else p.get("category"))
+    date_col = CENSUS_COLS[rtype][-1]
+    return {
+        "Staff ID": str_id(p.get("staff_no")) or str_id(r.get("staff_no")), "* First Name": first or None,
+        "* Family Name": family.strip() or None,
+        "* Dependency": str(p["dependency"]).title() if nn(p.get("dependency")) else None,
+        "* Gender ": {"M": "Male", "F": "Female"}.get(norm_gender(p.get("gender"))),
+        "* Date of Birth ": _to_date(p.get("dob")), "* Plan": plan, "* Mobile Number": nn(p.get("phone")),
+        "Email ID": None, "* National ID": nn(p.get("national_id")),
+        "Policy No": str(nn(r.get("policy_no")) or ""), date_col: _to_date(r.get("effective_date"))}
+
+
+def census_df(rtype, reqs):
+    if "created_at" in reqs.columns and len(reqs):
+        reqs = reqs.sort_values(["created_at", "ref_no"], kind="stable")  # الأقدم الأول
+    rows = [_census_row(rtype, r) for r in reqs.to_dict("records")]
+    return pd.DataFrame(rows, columns=CENSUS_COLS[rtype])
+
+
+def census_workbook(frames):
+    """ملف Census List فيه الـ 3 صفحات. frames = {"add": df, "delete": df, "upgrade": df} (أي نوع ناقص بتفضل صفحته بعناوينها بس)."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+    wb = Workbook()
+    wb.remove(wb.active)
+    for rtype, sheet in CENSUS_SHEETS.items():
+        ws = wb.create_sheet(sheet)
+        cols = CENSUS_COLS[rtype]
+        ws.append(cols)
+        for c in ws[1]:
+            c.font = Font(bold=True)
+        df = frames.get(rtype)
+        for rec in (df.to_dict("records") if df is not None else []):
+            ws.append([None if (v is None or (not isinstance(v, (date, datetime, str)) and pd.isna(v))) else v
+                       for v in (rec.get(c) for c in cols)])
+        for i, col in enumerate(cols, 1):
+            ws.column_dimensions[ws.cell(1, i).column_letter].width = 22 if i == 1 else 18
+            for row in range(2, ws.max_row + 1):
+                cell = ws.cell(row, i)
+                if col in _CENSUS_DATE_COLS:
+                    cell.number_format = "d-mmm-yy"
+                elif col in _CENSUS_TEXT_COLS:
+                    cell.number_format = "@"
+        ws.freeze_panes = "A2"
+        ws.page_setup.orientation = "landscape"  # للطباعة: صفحة واحدة بالعرض
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+        ws.page_setup.fitToHeight = 0
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
 
 
 def export_df(rtype, reqs):
+    if rtype in CENSUS_COLS:
+        return census_df(rtype, reqs)
     rows = []
-    pol_end = {str(x["policy_no"]): x["end_date"] for x in policies_df().to_dict("records")} if rtype in ("add", "delete") else {}
     for r in reqs.to_dict("records"):
         p = _payload(r)
-        gender = {"M": "Male", "F": "Female"}.get(norm_gender(p.get("gender")))
-        dep = str(p["dependency"]).title() if nn(p.get("dependency")) else None
-        if rtype == "add":  # الإضافة: تاريخ الإضافة = Start Date، والنهاية من الكارنيه أو من نهاية الوثيقة
-            rows.append(_allianz_row(
-                Employee_No=p.get("staff_no"), Employee_Name=r["member_name"], Date_of_Birth=fmt_allianz(p.get("dob")),
-                Gender=gender, Dependency=dep, Category=norm_category(p.get("category")),
-                Start_Date=fmt_allianz(r["effective_date"], True),
-                End_Date=fmt_allianz(p.get("source_end") or pol_end.get(str(r["policy_no"])), True),
-                Notes=p.get("national_id")))
-        elif rtype == "delete":  # الحذف: End Date = تاريخ الحذف
-            rows.append(_allianz_row(
-                Employee_No=p.get("staff_no"), Employee_Name=r["member_name"], Date_of_Birth=fmt_allianz(p.get("dob")),
-                Gender=gender, Dependency=dep, Category=norm_category(p.get("category")), Card_Number=p.get("card_no"),
-                Start_Date=fmt_allianz(p.get("source_start"), True), End_Date=fmt_allianz(r["effective_date"], True),
-                Notes=p.get("national_id")))
-        elif rtype == "upgrade":
-            rows.append({"Name": r["member_name"], "Staff ID": p.get("staff_no"), "Card No": p.get("card_no"),
-                         "National ID": p.get("national_id"), "Policy": r["policy_no"],
-                         "Old Tier": p.get("old_category"), "New Tier": p.get("new_category"),
-                         "Date": fmt_date(r["effective_date"])})
-        else:
-            rows.append({"Name": r["member_name"], "Staff ID": p.get("staff_no"), "Card No": p.get("card_no"),
-                         "Policy": r["policy_no"], "Reason": p.get("reason"), "Date": fmt_date(r["effective_date"])})
-    return pd.DataFrame(rows, columns=ALLIANZ_COLS if rtype in ("add", "delete") else None)
+        rows.append({"Name": r["member_name"], "Staff ID": p.get("staff_no"), "Card No": p.get("card_no"),
+                     "Policy": r["policy_no"], "Reason": p.get("reason"), "Date": fmt_date(r["effective_date"])})
+    return pd.DataFrame(rows)
 
 
 def to_excel_bytes(df):

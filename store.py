@@ -63,6 +63,7 @@ COLS = {
     "audit_log": ["actor", "role", "action", "entity", "ref", "details"],
     "insurance_providers": ["name", "code", "is_active", "email"],
     "client_companies": ["name", "provider_id", "policy_no", "is_active"],
+    "app_users": ["username", "full_name", "role", "password_hash", "policies", "is_active", "created_by"],
 }
 
 TYPE_AR = {"add": "إضافة", "delete": "حذف", "replace": "بدل فاقد", "upgrade": "ترقية فئة"}
@@ -209,7 +210,30 @@ def _clean(table, row, drop_none):
     return out
 
 
+SCOPED_TABLES = {"members", "requests", "approvals", "policies"}  # الجداول اللي الأدمن بيشوف منها مدارسه بس
+
+
+def current_scope():
+    """قايمة أرقام وثائق الأدمن الحالي، أو None (المدير والموظف والنظام: من غير فلترة)."""
+    ss = st.session_state
+    return list(ss.get("scope") or []) if ss.get("role") == "admin" else None
+
+
+def in_scope(policy_no):
+    sc = current_scope()
+    return sc is None or str(nn(policy_no) or "") in sc
+
+
 def load(table):
+    """قراءة مفلترة تلقائياً: الأدمن بيشوف مدارسه بس. القراءة الكاملة للأرقام المرجعية في _load_raw."""
+    df = _load_raw(table)
+    sc = current_scope()
+    if sc is not None and table in SCOPED_TABLES and "policy_no" in df.columns:
+        df = df[df["policy_no"].astype(str).isin(sc)].reset_index(drop=True)
+    return df
+
+
+def _load_raw(table):
     cols = ["id"] + COLS[table] + ["created_at"]
     rows = []
     try:
@@ -329,6 +353,8 @@ def rows_from_df(df, mapping):
 def upsert_members(policy_no, rows):
     """يستورد صفوف الماستر: العضو (بالرقم الوظيفي أو الاسم) يتحدّث، والجديد يتضاف.
     مبيمسحش حد، ومبيغيّرش حالة العضوية. يرجّع (جديد، متحدّث، من غير تغيير)."""
+    if not in_scope(policy_no):
+        raise PermissionError("policy out of scope")
     existing = load("members")
     existing = existing[existing["policy_no"].astype(str) == str(policy_no)]
     by_staff, by_name, rec = {}, {}, {}
@@ -382,6 +408,8 @@ def policies_df():
 
 
 def save_policy_dates(policy_no, start, end):
+    if not in_scope(policy_no):
+        raise PermissionError("policy out of scope")
     row = {"policy_no": policy_no, "type": "p_health", "start_date": to_iso(start), "end_date": to_iso(end),
            "status": "active"}
     if SB:
@@ -632,7 +660,7 @@ def audit(action, entity, ref=None, details=None, actor=None, role=None):
 # ───────────────────────── الطلبات ─────────────────────────
 def next_ref(rtype):
     prefix = f"REQ-{REF_PREFIX[rtype]}-{datetime.now(CAIRO).year}-"
-    nums = [int(x[len(prefix):]) for x in load("requests")["ref_no"].dropna().astype(str)
+    nums = [int(x[len(prefix):]) for x in _load_raw("requests")["ref_no"].dropna().astype(str)
             if x.startswith(prefix) and x[len(prefix):].isdigit()]
     return f"{prefix}{(max(nums) if nums else 0) + 1:04d}"
 
@@ -643,6 +671,8 @@ def _json_safe(d):
 
 def create_request(rtype, policy_no, member_name, payload, user, member_id=None, staff_no=None,
                    effective_date=None, details=None):
+    if not in_scope(policy_no):
+        raise PermissionError("policy out of scope")
     rec = insert("requests", {
         "ref_no": next_ref(rtype), "type": rtype, "member_id": member_id, "member_name": member_name,
         "staff_no": staff_no, "policy_no": policy_no, "effective_date": to_iso(effective_date),
@@ -942,12 +972,14 @@ AP_STATUS_AR = {"pending": "معلّقة", "approved": "موافق عليها", 
 
 def next_approval_ref():
     prefix = f"AP-{datetime.now(CAIRO).year}-"
-    nums = [int(x[len(prefix):]) for x in load("approvals")["ref_no"].dropna().astype(str)
+    nums = [int(x[len(prefix):]) for x in _load_raw("approvals")["ref_no"].dropna().astype(str)
             if x.startswith(prefix) and x[len(prefix):].isdigit()]
     return f"{prefix}{(max(nums) if nums else 0) + 1:04d}"
 
 
 def create_approval(member, ap_type, provider, hospital, amount, details, user):
+    if not in_scope(member["policy_no"]):
+        raise PermissionError("policy out of scope")
     if (nn(member["status"]) or "active") != "active":
         return None, "err_not_active"
     rec = insert("approvals", {
@@ -1123,7 +1155,8 @@ def _schools():
 
 def clients():
     """المدارس المفعّلة فقط: {رقم الوثيقة: الاسم}."""
-    return {no: s["name"] for no, s in _schools()["schools"].items() if s["active"]}
+    sc = current_scope()
+    return {no: s["name"] for no, s in _schools()["schools"].items() if s["active"] and (sc is None or no in sc)}
 
 
 def school_name(policy_no):
@@ -1183,6 +1216,12 @@ def add_school(name, policy_no, provider_name, provider_email=None):
         return None, err
     rec = insert("client_companies", {"name": name, "provider_id": pid, "policy_no": no})
     invalidate_schools()
+    ss = st.session_state
+    if ss.get("role") == "admin" and ss.get("user_id"):  # الأدمن اللي أضاف المدرسة تتعيّن له أوتوماتيك
+        u = user_by_id(ss["user_id"])
+        if u and no not in u["policies"]:
+            update("app_users", u["id"], {"policies": u["policies"] + [no]})
+            ss["scope"] = u["policies"] + [no]
     audit("school_added", "school", no, f"{name} | {nn(provider_name)}")
     return rec, None
 
@@ -1190,6 +1229,8 @@ def add_school(name, policy_no, provider_name, provider_email=None):
 def update_school(policy_no, name, provider_name, active):
     s = school_list().get(str(policy_no))
     name = nn(name)
+    if not in_scope(policy_no):
+        return "err_scope"
     if not s or not s["id"] or not name:
         return "err_school_fields"
     pid, err = _ensure_provider(provider_name, None)
@@ -1243,10 +1284,189 @@ def read_session_token(tok):
         d = json.loads(base64.urlsafe_b64decode(b + "=" * (-len(b) % 4)).decode())
     except (ValueError, UnicodeDecodeError):
         return None
-    if not isinstance(d, dict) or d.get("e", 0) < time.time() or d.get("r") not in ("admin", "viewer", "employee"):
+    if not isinstance(d, dict) or d.get("e", 0) < time.time() or d.get("r") not in ("admin", "manager", "employee"):
         return None
     return d
 
 
 def secret_cookie():
     return secret("COOKIE_SECRET")
+
+
+
+# ───────────────────────── حسابات المستخدمين (مدير + أدمنز بمدارس محددة) ─────────────────────────
+ROLES = ("manager", "admin")
+MIN_PW = 6
+LOCK_AFTER, LOCK_SECONDS = 5, 600  # 5 محاولات غلط على نفس الحساب = قفل 10 دقايق (لكل حساب، مش لكل جلسة)
+_LOGIN_FAILS = {}
+_PW_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
+_USERNAME_RE = re.compile(r"[a-z0-9._-]{3,30}")
+
+
+def _hash_pw(pw, salt):
+    return hashlib.pbkdf2_hmac("sha256", str(pw).encode(), salt, 200_000).hex()
+
+
+def make_pw_hash(pw):
+    salt = secrets.token_bytes(16)
+    return f"{salt.hex()}${_hash_pw(pw, salt)}"
+
+
+def check_pw(pw, stored):
+    try:
+        salt_hex, _, h = str(stored or "").partition("$")
+        return hmac.compare_digest(_hash_pw(pw, bytes.fromhex(salt_hex)), h)
+    except ValueError:
+        return False
+
+
+def random_password(n=10):
+    return "".join(secrets.choice(_PW_CHARS) for _ in range(n))
+
+
+def _norm_user(r):
+    pol = r.get("policies")
+    if isinstance(pol, str):
+        try:
+            pol = json.loads(pol)
+        except ValueError:
+            pol = []
+    return {"id": r["id"], "username": nn(r.get("username")) or "", "full_name": nn(r.get("full_name")) or "",
+            "role": nn(r.get("role")) or "admin", "policies": [str(x) for x in (pol if isinstance(pol, list) else [])],
+            "active": _flag(r.get("is_active")), "password_hash": nn(r.get("password_hash")),
+            "created_at": nn(r.get("created_at"))}
+
+
+def users_list():
+    return [_norm_user(r) for r in _load_raw("app_users").to_dict("records")]
+
+
+def user_by_id(uid):
+    return next((u for u in users_list() if u["id"] == uid), None)
+
+
+def has_active_manager():
+    return any(u["role"] == "manager" and u["active"] for u in users_list())
+
+
+def authenticate(username, password):
+    """يرجّع المستخدم لو الاسم والباسورد صح والحساب مفعّل، وإلا None (بنفس زمن الرد تقريباً)."""
+    key = str(username or "").strip().casefold()
+    u = next((x for x in users_list() if x["username"].casefold() == key), None)
+    ok = check_pw(password, u["password_hash"] if u else "00$00")
+    return u if (u and u["active"] and ok) else None
+
+
+def apply_user(u):
+    """بيحط بيانات المستخدم ومدارسه في الجلسة (الأدمن بس هو اللي ليه فلترة)."""
+    ss = st.session_state
+    ss["role"], ss["user_id"], ss["username"] = u["role"], u["id"], u["username"]
+    ss["user_name"] = u["full_name"] or u["username"]
+    ss["scope"] = list(u["policies"]) if u["role"] == "admin" else None
+
+
+def end_session():
+    for k in ("role", "user_name", "user_id", "username", "scope", "member_id", "_new_code", "_user_chk", "bootstrap"):
+        st.session_state.pop(k, None)
+
+
+def refresh_session_user():
+    """كل 30 ثانية بيراجع حساب المستخدم: لو اتعطّل أو اتمسح بيتقفل، ولو اتغيّرت مدارسه أو صلاحيته بتتطبّق."""
+    ss = st.session_state
+    uid = ss.get("user_id")
+    if not uid or time.time() - ss.get("_user_chk", 0) < 30:
+        return True
+    u = user_by_id(uid)
+    ss["_user_chk"] = time.time()
+    if not u or not u["active"]:
+        end_session()
+        return False
+    apply_user(u)
+    return True
+
+
+def login_blocked(username):
+    """الثواني المتبقية لقفل الحساب بعد محاولات غلط كتير، أو 0."""
+    key = str(username or "").strip().casefold()
+    now = time.time()
+    fails = [t for t in _LOGIN_FAILS.get(key, []) if now - t < LOCK_SECONDS]
+    _LOGIN_FAILS[key] = fails
+    return int(LOCK_SECONDS - (now - fails[0])) if len(fails) >= LOCK_AFTER else 0
+
+
+def note_login_failure(username):
+    key = str(username or "").strip().casefold()[:60]
+    _LOGIN_FAILS.setdefault(key, []).append(time.time())
+    if len(_LOGIN_FAILS) > 500:  # تنضيف الأسماء القديمة
+        for k in [k for k, v in _LOGIN_FAILS.items() if not v or time.time() - v[-1] > LOCK_SECONDS]:
+            _LOGIN_FAILS.pop(k, None)
+
+
+def clear_login_failures(username):
+    _LOGIN_FAILS.pop(str(username or "").strip().casefold(), None)
+
+
+def create_user(username, full_name, role, policies, created_by, password=None):
+    """يرجّع (المستخدم، الباسورد) أو (None، مفتاح الخطأ). لو المدير كتب باسورد بيتستخدم، وإلا بيتولّد عشوائي.
+    الباسورد مش بيتخزن، المخزّن هاش بس."""
+    username, full_name = str(nn(username) or "").casefold(), nn(full_name)
+    if not _USERNAME_RE.fullmatch(username) or not full_name:
+        return None, "err_username"
+    if role not in ROLES:
+        return None, "err_role"
+    if any(u["username"].casefold() == username for u in users_list()):
+        return None, "err_user_dup"
+    policies = [str(x) for x in (policies or [])] if role == "admin" else []
+    if role == "admin" and (not policies or any(p not in school_list() for p in policies)):
+        return None, "err_no_school"
+    if nn(password) is not None and len(str(password)) < MIN_PW:
+        return None, "err_pw_short"
+    pw = str(password) if nn(password) is not None else random_password()
+    rec = insert("app_users", {"username": username, "full_name": full_name, "role": role,
+                               "password_hash": make_pw_hash(pw), "policies": policies, "is_active": True,
+                               "created_by": created_by})
+    audit("user_created", "user", username, f"{role} | {len(policies)} schools")
+    return _norm_user({**rec, "username": username, "full_name": full_name, "role": role, "policies": policies}), pw
+
+
+def update_user(uid, full_name, role, policies, active):
+    """يرجّع None لو نجح أو مفتاح الخطأ. مينفعش يتشال آخر مدير مفعّل."""
+    u = user_by_id(uid)
+    full_name = nn(full_name)
+    if not u or not full_name:
+        return "err_username"
+    if role not in ROLES:
+        return "err_role"
+    policies = [str(x) for x in (policies or [])] if role == "admin" else []
+    if role == "admin" and (not policies or any(p not in school_list() for p in policies)):
+        return "err_no_school"
+    others = [x for x in users_list() if x["id"] != uid and x["role"] == "manager" and x["active"]]
+    if not others and not (role == "manager" and active):
+        return "err_last_manager"
+    update("app_users", uid, {"full_name": full_name, "role": role, "policies": policies, "is_active": bool(active)})
+    audit("user_updated", "user", u["username"], f"{role} | active={bool(active)} | {len(policies)} schools")
+    return None
+
+
+def reset_password(uid, password=None):
+    """يرجّع (الباسورد، None) أو (None، مفتاح الخطأ). من غير باسورد بيتولّد عشوائي."""
+    u = user_by_id(uid)
+    if not u:
+        return None, "err_username"
+    if nn(password) is not None and len(str(password)) < MIN_PW:
+        return None, "err_pw_short"
+    pw = str(password) if nn(password) is not None else random_password()
+    update("app_users", uid, {"password_hash": make_pw_hash(pw)})
+    audit("user_password", "user", u["username"], "reset by manager")
+    return pw, None
+
+
+def change_own_password(uid, old, new):
+    u = user_by_id(uid)
+    if not u or not check_pw(old, u["password_hash"]):
+        return "err_pw_old"
+    if len(str(new or "")) < MIN_PW:
+        return "err_pw_short"
+    update("app_users", uid, {"password_hash": make_pw_hash(new)})
+    audit("user_password", "user", u["username"], "changed by user")
+    return None

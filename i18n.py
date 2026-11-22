@@ -220,7 +220,7 @@ S.update({
     "err_required": ("الموبايل والرقم الوظيفي والفئة (Plan) مطلوبين", "Phone, staff number and tier (plan) are required"),
     "files_missing": ("ناقص بيانات مطلوبة لـ Allianz في: {names}. كمّلها قبل ما تبعت الملف.",
                       "Required Allianz fields are missing for: {names}. Complete them before sending the file."),
-    "sc_add": ("➕ إضافة مدرسة", "➕ Add a school"), "sc_manage": ("🏫 إدارة المدارس وشركات التأمين", "🏫 Manage schools and insurers"),
+    "sc_add": ("➕ إضافة عميل", "➕ Add client"), "sc_manage": ("🏫 إدارة المدارس وشركات التأمين", "🏫 Manage schools and insurers"),
     "sc_name": ("اسم المدرسة", "School name"), "sc_provider": ("شركة التأمين", "Insurance company"),
     "sc_new_provider": ("➕ شركة تأمين جديدة (اكتب اسمها تحت)", "➕ New insurer (type its name below)"),
     "sc_new_name": ("اسم شركة التأمين الجديدة", "New insurer name"),

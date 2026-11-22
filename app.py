@@ -103,7 +103,18 @@ def user():
 
 
 def can_edit():
+    """تنفيذ الإجراءات (إضافة/حذف/ترقية/استيراد/موافقات): الأدمن بس، في مدارسه."""
     return st.session_state.get("role") == "admin"
+
+
+def can_manage():
+    """المدير: بيشوف ويراجع كل حاجة وبيدير المستخدمين وسجل التدقيق."""
+    return st.session_state.get("role") == "manager"
+
+
+def can_config():
+    """المدارس وشركات التأمين وتواريخ الوثائق والإعدادات: المدير والأدمن."""
+    return st.session_state.get("role") in ("admin", "manager")
 
 
 def policy_label(no):
@@ -180,10 +191,10 @@ def try_auto_login():
     d = S.read_session_token(request_cookies().get(AUTH_COOKIE))
     if not d:
         return
-    if d["r"] in ("admin", "viewer"):
-        pw = S.secret("ADMIN_PASSWORD" if d["r"] == "admin" else "VIEWER_PASSWORD")
-        if pw and S.token_fp(pw) == d.get("f"):
-            ss.role, ss.user_name = d["r"], d.get("n") or ""
+    if d["r"] in ("admin", "manager"):
+        u = S.user_by_id(d.get("m"))
+        if u and u["active"] and u["password_hash"] and S.token_fp(u["password_hash"]) == d.get("f"):
+            S.apply_user(u)
         return
     m = S.load("members")
     hit = m[m["id"] == d.get("m")]
@@ -201,24 +212,43 @@ def login_screen():
                     f'<div class="pill">{t("tagline")}</div></div>', unsafe_allow_html=True)
         tab_staff, tab_emp = st.tabs([t("login_staff"), t("login_emp")])
         with tab_staff:
-            pw = {"admin": S.secret("ADMIN_PASSWORD"), "viewer": S.secret("VIEWER_PASSWORD")}
-            roles = [r for r, p in pw.items() if p]
-            if not roles:
+            ss = st.session_state
+            boot_pw = S.secret("ADMIN_PASSWORD")
+            no_manager = not S.has_active_manager()
+            if no_manager and not boot_pw:
                 st.error(t("no_secrets"))
+            elif ss.get("staff_fail", 0) >= 5:
+                st.error(t("emp_locked"))
             else:
                 with st.form("login"):
-                    role = st.selectbox(t("role"), roles, format_func=t)
-                    name = st.text_input(t("user_name"))
+                    uname = st.text_input(t("username"))
                     typed = st.text_input(t("pw"), type="password")
                     if st.form_submit_button(t("login")):
-                        if hmac.compare_digest(typed.encode(), pw[role].encode()):
-                            S.audit("login", "session", None, role, actor=name.strip() or "—", role=role)
-                            st.session_state.role, st.session_state.user_name = role, name.strip()
-                            remember(S.make_session_token(role, name.strip(), None, S.token_fp(pw[role])))
+                        wait = S.login_blocked(uname)
+                        u = None if wait else S.authenticate(uname, typed)
+                        if wait:
+                            st.error(t("acct_locked").format(m=max(1, wait // 60)))
+                        elif u:
+                            S.clear_login_failures(uname)
+                            ss["staff_fail"] = 0
+                            S.apply_user(u)
+                            S.audit("login", "session", None, u["role"], actor=ss["user_name"], role=u["role"])
+                            remember(S.make_session_token(u["role"], ss["user_name"], u["id"], S.token_fp(u["password_hash"])))
+                            st.rerun()
+                        elif no_manager and boot_pw and hmac.compare_digest(str(typed).encode(), boot_pw.encode()):
+                            # دخول مؤقت لأول مرة بس: لإنشاء حساب المدير. بيتوقف أول ما يتعمل مدير.
+                            ss["staff_fail"] = 0
+                            ss.role, ss.user_id, ss.user_name, ss.scope, ss.bootstrap = "manager", None, t("boot_name"), None, True
+                            S.audit("login", "session", None, "bootstrap", actor=ss["user_name"], role="manager")
                             st.rerun()
                         else:
-                            S.audit("login_failed", "session", None, role, actor=name.strip() or "—", role=role)
-                            st.error(t("bad_pw"))
+                            ss["staff_fail"] = ss.get("staff_fail", 0) + 1
+                            S.note_login_failure(uname)
+                            S.audit("login_failed", "session", None, "staff", actor=str(uname).strip()[:40] or "—", role=None)
+                            time.sleep(1)
+                            st.error(t("bad_login"))
+                if no_manager:
+                    st.caption(t("login_bootstrap"))
         with tab_emp:
             ss = st.session_state
             if ss.get("emp_fail", 0) >= 5:
@@ -256,9 +286,13 @@ def page_dash():
     stat(c[1], open_n, t("m_open"), gold=True)
     stat(c[2], int((reqs["status"] == "done").sum()), t("m_done"))
     stat(c[3], int((members["status"] == "terminated").sum()), t("m_term"))
+    if st.session_state.get("role") == "admin" and not S.current_scope():
+        st.warning(t("no_schools"))
     if drafts:
         st.info(t("drafts_alert").format(n=drafts))
     show_alerts(members, reqs)
+    if can_manage():
+        admin_activity(reqs, S.load("approvals"))
     a, b = st.columns(2)
     with a:
         st.subheader(t("recent"))
@@ -278,8 +312,27 @@ def page_dash():
         table(pd.DataFrame(rows))
 
 
+def admin_activity(reqs, appr):
+    """المدير: نشاط كل أدمن (الطلبات اللي عملها، الموافقات اللي قرّر فيها، آخر حركة، ومدارسه)."""
+    admins = [u for u in S.users_list() if u["role"] == "admin"]
+    if not admins:
+        return
+    log = S.load("audit_log")
+    rows = []
+    for u in admins:
+        name = u["full_name"] or u["username"]
+        last = log[log["actor"] == name]["created_at"].max() if not log.empty else None
+        rows.append({t("us_fullname"): name, t("us_schools"): "، ".join(S.school_name(p) or p for p in u["policies"]) or "—",
+                     t("ad_reqs"): int((reqs["created_by"] == name).sum()),
+                     t("ad_decided"): int((appr["decided_by"] == name).sum()),
+                     t("ad_last"): S.fmt_ts(last) if last is not None and not pd.isna(last) else "—",
+                     t("sc_status"): t("sc_on") if u["active"] else t("sc_off")})
+    st.subheader(t("us_activity"))
+    table(pd.DataFrame(rows))
+
+
 def schools_admin():
-    schools, provs = S.school_list(), S.provider_list()
+    schools, provs = {k: v for k, v in S.school_list().items() if S.in_scope(k)}, S.provider_list()
     names, NEW = [p["name"] for p in provs], "__new__"
     with st.expander(t("sc_add")):
         with st.form("sc_add_form", clear_on_submit=True):
@@ -346,7 +399,7 @@ def schools_admin():
 
 def page_policies():
     st.header(t("policies"))
-    if can_edit():
+    if can_config():
         schools_admin()
     pol, members, reqs = S.policies_df(), S.load("members"), S.load("requests")
     members["status"] = members["status"].fillna("active")
@@ -366,7 +419,7 @@ def page_policies():
 <div class="counts"><div><b>{int((m["status"] == "active").sum())}</b>{t("n_active")}</div>
 <div><b>{int((m["status"] == "terminated").sum())}</b>{t("n_term")}</div>
 <div><b>{n_open}</b>{t("pol_open")}</div></div></div>""", unsafe_allow_html=True)
-            if can_edit():
+            if can_config():
                 with st.expander(t("pol_edit")):
                     with st.form(f"pol_{no}"):
                         s = st.date_input(t("pol_start"), value=date_or_none(p["start_date"]) or date.today(),
@@ -594,11 +647,15 @@ def page_requests():
                    label_visibility="collapsed",
                    format_func=lambda s: f"{t('all') if s == '*' else t('st_' + s)} "
                                          f"({len(reqs) if s == '*' else int(counts.get(s, 0))})")
-    f = st.columns(3)
+    f = st.columns(4 if can_manage() else 3)
     typ = f[0].selectbox(t("rq_type"), ["*"] + S.REQ_TYPES, format_func=all_or(lambda x: t("ty_" + x)))
     pol = f[1].selectbox(t("flt_policy"), ["*"] + list(S.clients()), format_func=all_or(policy_label))
     q = f[2].text_input(t("search"))
+    who = f[3].selectbox(t("by_admin"), ["*"] + sorted(reqs["created_by"].dropna().unique()),
+                         format_func=all_or(str)) if can_manage() else "*"
     v = reqs
+    if who != "*":
+        v = v[v["created_by"] == who]
     if sel != "*":
         v = v[v["status"] == sel]
     if typ != "*":
@@ -758,7 +815,7 @@ def page_settings():
     ecfg = S.email_cfg()
     if ecfg:
         st.success(t("email_on").format(to=", ".join(ecfg["to"])))
-        if can_edit() and st.button(t("email_test")):
+        if can_config() and st.button(t("email_test")):
             err = S.send_email_now(ecfg, "[Myshurance] " + t("email_test_subject"), t("email_test_body"), "test")
             if err:
                 st.error(t("email_test_fail").format(e=err))
@@ -783,7 +840,7 @@ def page_settings():
     c = st.columns(3)
     for col, s in zip(c, ["pending", "sent", "failed"]):
         stat(col, int((n["status"] == s).sum()), t("notif_" + s))
-    if can_edit() and st.button(t("notif_test")):
+    if can_config() and st.button(t("notif_test")):
         S.notify("test", f"✅ رسالة تجربة من Myshurance\nبواسطة: {user() or '—'}\nالوقت: {S._t()}")
         flash("success", t("notif_test_sent"))
         st.rerun()
@@ -862,6 +919,11 @@ def page_approvals():
                    format_func=lambda s_: f"{t('all') if s_ == '*' else t('ast_' + s_)} "
                                           f"({len(appr) if s_ == '*' else int(counts.get(s_, 0))})")
     v = appr if sel == "*" else appr[appr["status"] == sel]
+    if can_manage():
+        who = st.selectbox(t("by_admin"), ["*"] + sorted(set(appr["created_by"].dropna()) | set(appr["decided_by"].dropna())),
+                           format_func=all_or(str), key="ap_who")
+        if who != "*":
+            v = v[(v["created_by"] == who) | (v["decided_by"] == who)]
     if v.empty:
         st.info(t("nothing"))
         return
@@ -909,7 +971,7 @@ def page_reports():
     st.header(t("reports"))
     members, reqs, appr, pols = S.load("members"), S.load("requests"), S.load("approvals"), S.policies_df()
     members["status"] = members["status"].fillna("active")
-    labels = [t("rp_search"), t("rp_analytics"), t("rp_monthly"), t("rp_export")] + ([t("rp_audit")] if can_edit() else [])
+    labels = [t("rp_search"), t("rp_analytics"), t("rp_monthly"), t("rp_export")] + ([t("rp_audit")] if can_manage() else [])
     tabs = st.tabs(labels)
     t_search, t_an, t_month, t_exp = tabs[:4]
 
@@ -987,7 +1049,7 @@ def page_reports():
         pick = sheets if what == "all" else {what.capitalize(): sheets[what.capitalize()]}
         st.download_button(t("rp_export"), S.to_excel_sheets(pick), f"Myshurance_{what}_{date.today()}.xlsx", mime=XLSX)
 
-    if can_edit():
+    if can_manage():
         with tabs[4]:
             audit_tab()
 
@@ -1080,11 +1142,109 @@ def page_employee():
     st.caption(t("emp_note"))
 
 
+def page_users():
+    if not can_manage():
+        st.error(t("no_access"))
+        return
+    st.header(t("users"))
+    if st.session_state.get("bootstrap"):
+        st.warning(t("us_bootstrap"))
+    users, schools = S.users_list(), S.school_list()
+    label = lambda p: f"{p} - {schools[p]['name']}" if p in schools else p  # noqa: E731
+    if users:
+        table(pd.DataFrame([{t("us_username"): u["username"], t("us_fullname"): u["full_name"], t("us_role"): t(u["role"]),
+                             t("us_schools"): "، ".join(label(p) for p in u["policies"]) if u["role"] == "admin" else t("us_all"),
+                             t("sc_status"): t("sc_on") if u["active"] else t("sc_off")} for u in users]))
+    shown = st.session_state.pop("_new_pw", None)
+    if shown:
+        st.success(t("us_pw_once").format(u=shown[0]))
+        st.code(shown[1], language=None)
+    with st.expander(t("us_add"), expanded=not users):
+        with st.form("us_add_form", clear_on_submit=True):
+            c = st.columns(3)
+            uname = c[0].text_input(t("us_username"))
+            fname = c[1].text_input(t("us_fullname"))
+            role = c[2].selectbox(t("us_role"), list(S.ROLES), index=1, format_func=t)
+            pols = st.multiselect(t("us_schools"), list(schools), format_func=label)
+            typed_pw = st.text_input(t("us_password"), type="password")
+            st.caption(t("us_add_hint"))
+            if st.form_submit_button(t("save")):
+                try:
+                    u, pw = S.create_user(uname, fname, role, pols, user(), typed_pw or None)
+                except Exception as ex:  # noqa: BLE001
+                    u, pw = None, None
+                    st.error(t("us_fail").format(e=ex))
+                else:
+                    if u is None:
+                        st.error(t(pw))
+                    else:
+                        if not typed_pw:  # اتولّد تلقائي: بيظهر مرة واحدة
+                            st.session_state["_new_pw"] = (u["username"], pw)
+                        flash("success", t("us_created").format(u=u["username"]))
+                        st.rerun()
+    if users:
+        with st.expander(t("us_edit")):
+            uid = st.selectbox(t("us_username"), [u["id"] for u in users],
+                               format_func=lambda i: next(u["username"] for u in users if u["id"] == i), key="us_pick")
+            cur = next(u for u in users if u["id"] == uid)
+            with st.form(f"us_edit_{uid}"):
+                nm = st.text_input(t("us_fullname"), value=cur["full_name"])
+                rl = st.selectbox(t("us_role"), list(S.ROLES), index=list(S.ROLES).index(cur["role"]), format_func=t)
+                pl = st.multiselect(t("us_schools"), list(schools), default=[p for p in cur["policies"] if p in schools],
+                                    format_func=label)
+                act = st.checkbox(t("sc_active"), value=cur["active"])
+                if st.form_submit_button(t("save")):
+                    try:
+                        e = S.update_user(uid, nm, rl, pl, act)
+                    except Exception as ex:  # noqa: BLE001
+                        e = None
+                        st.error(t("us_fail").format(e=ex))
+                    if e:
+                        st.error(t(e))
+                    else:
+                        flash("success", t("saved"))
+                        st.rerun()
+            new_pw = st.text_input(t("us_password"), type="password", key=f"us_newpw_{uid}")
+            if st.button(t("us_reset"), key=f"us_reset_{uid}"):
+                pw, err = S.reset_password(uid, new_pw or None)
+                if err:
+                    st.error(t(err))
+                else:
+                    if not new_pw:
+                        st.session_state["_new_pw"] = (cur["username"], pw)
+                    flash("success", t("us_pw_set").format(u=cur["username"]))
+                    st.rerun()
+
+
+def page_account():
+    st.header(t("account"))
+    st.caption(f"{user() or '—'} · {t(st.session_state.get('role'))}")
+    uid = st.session_state.get("user_id")
+    if not uid:
+        st.info(t("ac_bootstrap"))
+        return
+    with st.form("pw_form", clear_on_submit=True):
+        old = st.text_input(t("ac_old"), type="password")
+        new = st.text_input(t("ac_new"), type="password")
+        new2 = st.text_input(t("ac_new2"), type="password")
+        if st.form_submit_button(t("save")):
+            if new != new2:
+                st.error(t("err_pw_match"))
+            else:
+                e = S.change_own_password(uid, old, new)
+                if e:
+                    st.error(t(e))
+                else:
+                    u = S.user_by_id(uid)  # الجهاز ده يفضل داخل بالباسورد الجديد
+                    remember(S.make_session_token(u["role"], user(), u["id"], S.token_fp(u["password_hash"])))
+                    flash("success", t("ac_done"))
+                    st.rerun()
+
+
 # ───────────────────────── التشغيل ─────────────────────────
 def logout_button():
     if st.button(t("logout")):
-        for k in ("role", "user_name", "member_id", "_new_code"):
-            st.session_state.pop(k, None)
+        S.end_session()
         st.session_state["_cookie_out"] = ("clear", None)
         st.session_state["_no_auto"] = True  # عشان الكوكي القديم ما يدخّلوش تاني قبل ما يتمسح
         st.rerun()
@@ -1106,6 +1266,7 @@ def main():
         st.radio("lang", ["العربية", "English"], horizontal=True, key="lang_label", label_visibility="collapsed")
     inject_css()
     try_auto_login()
+    S.refresh_session_user()
     emit_cookie()
     if "role" not in st.session_state:
         login_screen()
@@ -1126,9 +1287,13 @@ def main():
         pend_n = int((S.load("approvals")["status"] == "pending").sum())
     except Exception:  # noqa: BLE001
         open_n = pend_n = 0
-    pages = ["dash", "members", "requests", "approvals", "policies", "import", "reports", "settings"]
+    pages = ["dash", "members", "requests", "approvals", "policies", "import", "reports"]
+    pages += ["users"] if can_manage() else []
+    pages += ["settings", "account"]
     icons = {"dash": "▦", "members": "👥", "requests": "📋", "approvals": "🏥", "policies": "🛡️", "import": "📄",
-             "reports": "📊", "settings": "⚙️"}
+             "reports": "📊", "users": "🔑", "settings": "⚙️", "account": "👤"}
+    if st.session_state.get("page") not in pages:
+        st.session_state["page"] = "dash"
     badge = {"requests": open_n, "approvals": pend_n}
     with st.sidebar:
         st.markdown(brand, unsafe_allow_html=True)
@@ -1143,7 +1308,7 @@ def main():
     show_flash()
     run_page({"dash": page_dash, "members": page_members, "requests": page_requests, "approvals": page_approvals,
               "policies": page_policies, "import": page_import, "reports": page_reports,
-              "settings": page_settings}[page])
+              "users": page_users, "settings": page_settings, "account": page_account}[page])
 
 
 main()
